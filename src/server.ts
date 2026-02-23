@@ -4,7 +4,6 @@ import { createWorkersAI } from "workers-ai-provider";
 import {
     streamText,
     convertToModelMessages,
-    pruneMessages,
     tool,
     stepCountIs,
 } from "ai";
@@ -59,10 +58,7 @@ Today's date: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: 
         const result = streamText({
             model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
             system: systemPrompt,
-            messages: pruneMessages({
-                messages: await convertToModelMessages(this.messages),
-                toolCalls: [],
-            }),
+            messages: await convertToModelMessages(this.messages),
             tools: {
                 searchWeb: tool({
                     description:
