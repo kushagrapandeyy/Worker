@@ -1,20 +1,138 @@
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import { routeAgentRequest } from "agents";
-import { createWorkersAI } from "workers-ai-provider";
 import {
-    streamText,
-    convertToModelMessages,
-    tool,
-    stepCountIs,
-    wrapLanguageModel,
+    createUIMessageStream,
+    createUIMessageStreamResponse,
 } from "ai";
-import type { StreamTextOnFinishCallback, ToolSet } from "ai";
+import type { StreamTextOnFinishCallback, ToolSet, UIMessage } from "ai";
 import { z } from "zod";
 
 interface Env {
     AI: Ai;
     ChatAgent: DurableObjectNamespace;
     ASSETS: Fetcher;
+}
+
+type WorkersAIMessage = {
+    role: "system" | "user" | "assistant" | "tool";
+    content: string;
+    tool_call_id?: string;
+    name?: string;
+};
+
+type WorkersAIToolCall = {
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+};
+
+const TOOLS_SCHEMA = [
+    {
+        type: "function" as const,
+        function: {
+            name: "searchWeb",
+            description: "Search the web for current information on any topic.",
+            parameters: {
+                type: "object",
+                properties: {
+                    query: { type: "string", description: "The search query" },
+                },
+                required: ["query"],
+            },
+        },
+    },
+    {
+        type: "function" as const,
+        function: {
+            name: "getUserInfo",
+            description: "Get the user's browser timezone, locale, and local time. Runs in the user's browser.",
+            parameters: { type: "object", properties: {} },
+        },
+    },
+    {
+        type: "function" as const,
+        function: {
+            name: "setReminder",
+            description: "Schedule a reminder for the user. Always requires user approval first.",
+            parameters: {
+                type: "object",
+                properties: {
+                    message: { type: "string", description: "The reminder message" },
+                    delaySeconds: { type: "number", description: "Seconds from now to trigger" },
+                },
+                required: ["message", "delaySeconds"],
+            },
+        },
+    },
+];
+
+async function executeSearchWeb(query: string): Promise<string> {
+    try {
+        const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+        const res = await fetch(url);
+        const data = (await res.json()) as {
+            AbstractText: string;
+            RelatedTopics: Array<{ Text?: string; FirstURL?: string }>;
+        };
+        const abstract = data.AbstractText?.slice(0, 500) ?? null;
+        const related = (data.RelatedTopics ?? [])
+            .filter((t) => t.Text)
+            .slice(0, 4)
+            .map((t) => `- ${t.Text?.slice(0, 120)}`);
+        if (!abstract && related.length === 0) {
+            return JSON.stringify({ summary: `No results found for "${query}".` });
+        }
+        return JSON.stringify({ summary: abstract ?? "See related:", results: related });
+    } catch {
+        return JSON.stringify({ error: "Search temporarily unavailable." });
+    }
+}
+
+function uiMessagesToWorkersAI(messages: UIMessage[]): WorkersAIMessage[] {
+    const out: WorkersAIMessage[] = [];
+    for (const msg of messages) {
+        const textParts = msg.parts.filter((p) => p.type === "text");
+        const toolParts = msg.parts.filter((p) => typeof p.type === "string" && (p.type.startsWith("tool-") || p.type === "dynamic-tool")) as unknown as Array<{
+            type: string; toolCallId: string; toolName?: string; state: string;
+            input?: unknown; output?: unknown;
+        }>;
+
+        if (msg.role === "user") {
+            const text = textParts.map((p) => (p as { text: string }).text).join("\n");
+            if (text) out.push({ role: "user", content: text });
+            for (const t of toolParts) {
+                if (t.state === "output-available" || t.state === "rejected") {
+                    out.push({
+                        role: "tool",
+                        tool_call_id: t.toolCallId,
+                        name: t.toolName,
+                        content: t.state === "rejected"
+                            ? "Tool execution was rejected by the user."
+                            : JSON.stringify(t.output),
+                    });
+                }
+            }
+        } else if (msg.role === "assistant") {
+            const text = textParts.map((p) => (p as { text: string }).text).join("\n");
+            if (text) out.push({ role: "assistant", content: text });
+            const calls = toolParts.filter((t) =>
+                t.state === "output-available" || t.state === "approval-required" || t.state === "rejected"
+            );
+            if (calls.length > 0) {
+                out.push({
+                    role: "assistant",
+                    content: JSON.stringify(
+                        calls.map((t) => ({
+                            id: t.toolCallId,
+                            type: "function",
+                            function: { name: t.toolName, arguments: JSON.stringify(t.input ?? {}) },
+                        }))
+                    ),
+                });
+            }
+        }
+    }
+    return out;
 }
 
 export class ChatAgent extends AIChatAgent<Env> {
@@ -36,8 +154,6 @@ export class ChatAgent extends AIChatAgent<Env> {
     }
 
     async onChatMessage(onFinish: StreamTextOnFinishCallback<ToolSet>) {
-        const workersai = createWorkersAI({ binding: this.env.AI });
-
         const stateObj = (this.state as Record<string, unknown>) ?? {};
         const pendingReminders: string[] = Array.isArray(
             (stateObj as { reminders?: string[] }).reminders
@@ -45,120 +161,149 @@ export class ChatAgent extends AIChatAgent<Env> {
             ? (stateObj as { reminders: string[] }).reminders
             : [];
 
-        let systemPrompt = `You are Sage, a brilliant and friendly AI research assistant running on Cloudflare's global network.
-You can search the web for current information, learn about the user's browser context, and schedule reminders.
-Be concise, insightful, and always reference your tools when relevant.
-Format responses with clear structure using markdown when helpful.
-Today's date: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}.`;
+        let systemContent = `You are Sage, a brilliant AI research assistant on Cloudflare.
+Use your tools to answer questions. Always call searchWeb for factual/current info questions.
+Call getUserInfo when asked about timezone, location, locale, or browser info.
+Call setReminder when asked to set a reminder.
+Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}.`;
 
         if (pendingReminders.length > 0) {
-            systemPrompt += `\n\n--- ACTIVE REMINDERS ---\n${pendingReminders.join("\n")}\n--- END REMINDERS ---\nInform the user about these reminders.`;
+            systemContent += `\n\nACTIVE REMINDERS:\n${pendingReminders.join("\n")}\nInform the user.`;
             this.setState({ ...stateObj, reminders: [] });
         }
 
-        const model = wrapLanguageModel({
-            model: workersai("@cf/meta/llama-3.1-8b-instruct"),
-            middleware: {
-                specificationVersion: "v3" as const,
-                wrapGenerate: async ({ doGenerate, params }: any) => {
-                    if (params.tools) {
-                        params.tools = params.tools.map((t: any) => ({ ...t, type: "function" as const }));
-                    }
-                    return doGenerate(params);
-                },
-                wrapStream: async ({ doStream, params }: any) => {
-                    if (params.tools) {
-                        params.tools = params.tools.map((t: any) => ({ ...t, type: "function" as const }));
-                    }
-                    return doStream(params);
-                },
-            },
-        });
+        const historyMessages = uiMessagesToWorkersAI(this.messages);
+        const allMessages: WorkersAIMessage[] = [
+            { role: "system", content: systemContent },
+            ...historyMessages,
+        ];
 
-        const result = streamText({
-            model,
-            system: systemPrompt,
-            messages: await convertToModelMessages(this.messages),
-            tools: {
-                searchWeb: tool({
-                    description:
-                        "Search the web for current information on any topic. Returns a concise summary of results.",
-                    inputSchema: z.object({
-                        query: z.string().describe("The search query"),
-                    }),
-                    execute: async ({ query }) => {
-                        try {
-                            const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-                            const res = await fetch(url);
-                            const data = (await res.json()) as {
-                                AbstractText: string;
-                                AbstractURL: string;
-                                RelatedTopics: Array<{ Text?: string; FirstURL?: string }>;
-                            };
+        const stream = createUIMessageStream({
+            execute: async ({ writer }) => {
+                let pendingToolCalls: WorkersAIToolCall[] = [];
+                let stepMessages = [...allMessages];
+                let assistantText = "";
+                const toolResults: Array<{ toolCallId: string; toolName: string; result: unknown }> = [];
 
-                            const abstract = data.AbstractText
-                                ? data.AbstractText.slice(0, 500)
-                                : null;
+                for (let step = 0; step < 5; step++) {
+                    const response = await (this.env.AI as unknown as {
+                        run: (model: string, options: {
+                            messages: WorkersAIMessage[];
+                            tools: typeof TOOLS_SCHEMA;
+                            stream: boolean;
+                            max_tokens: number;
+                        }) => Promise<ReadableStream | { response?: string; tool_calls?: WorkersAIToolCall[] }>;
+                    }).run("@cf/meta/llama-3.1-8b-instruct", {
+                        messages: stepMessages,
+                        tools: TOOLS_SCHEMA,
+                        stream: false,
+                        max_tokens: 1024,
+                    });
 
-                            const related = data.RelatedTopics
-                                ? data.RelatedTopics.filter((t) => t.Text)
-                                    .slice(0, 4)
-                                    .map((t) => ({ title: t.Text?.slice(0, 120), url: t.FirstURL }))
-                                : [];
+                    const result = response as { response?: string; tool_calls?: WorkersAIToolCall[] };
+                    pendingToolCalls = result.tool_calls ?? [];
 
-                            if (!abstract && related.length === 0) {
-                                return {
-                                    query,
-                                    summary: `No instant answer found for "${query}". Suggest trying a more specific query.`,
-                                    results: [],
-                                };
+                    if (pendingToolCalls.length > 0) {
+                        stepMessages.push({
+                            role: "assistant",
+                            content: "",
+                        });
+
+                        for (const tc of pendingToolCalls) {
+                            const toolName = tc.function.name;
+                            let inputArgs: Record<string, unknown> = {};
+                            try {
+                                inputArgs = JSON.parse(tc.function.arguments || "{}");
+                            } catch { /* ignore parse error */ }
+
+                            const toolCallId = tc.id || `call_${Math.random().toString(36).slice(2, 9)}`;
+
+                            writer.write({
+                                type: "tool-input-available",
+                                toolCallId,
+                                toolName,
+                                input: inputArgs,
+                            });
+
+                            if (toolName === "getUserInfo") {
+                                writer.write({
+                                    type: "tool-output-available",
+                                    toolCallId,
+                                    output: { pending: "Waiting for browser..." },
+                                });
+                                return;
                             }
 
-                            return {
-                                query,
-                                summary: abstract ?? "See related results below.",
-                                results: related,
-                            };
-                        } catch {
-                            return {
-                                query,
-                                summary: "Search temporarily unavailable.",
-                                results: [],
-                            };
+                            if (toolName === "setReminder") {
+                                const schema = z.object({
+                                    message: z.string(),
+                                    delaySeconds: z.number(),
+                                });
+                                const parsed = schema.safeParse(inputArgs);
+                                if (parsed.success) {
+                                    const result = await this._scheduleReminder(
+                                        parsed.data.message,
+                                        parsed.data.delaySeconds
+                                    );
+                                    writer.write({
+                                        type: "tool-output-available",
+                                        toolCallId,
+                                        output: result,
+                                    });
+                                    stepMessages.push({
+                                        role: "tool",
+                                        tool_call_id: toolCallId,
+                                        name: toolName,
+                                        content: JSON.stringify(result),
+                                    });
+                                    toolResults.push({ toolCallId, toolName, result });
+                                }
+                                continue;
+                            }
+
+                            if (toolName === "searchWeb") {
+                                const query = (inputArgs.query as string) ?? "";
+                                const searchResult = await executeSearchWeb(query);
+                                writer.write({
+                                    type: "tool-output-available",
+                                    toolCallId,
+                                    output: JSON.parse(searchResult),
+                                });
+                                stepMessages.push({
+                                    role: "tool",
+                                    tool_call_id: toolCallId,
+                                    name: toolName,
+                                    content: searchResult,
+                                });
+                                toolResults.push({ toolCallId, toolName, result: JSON.parse(searchResult) });
+                            }
                         }
-                    },
-                }),
-
-                getUserInfo: tool({
-                    description:
-                        "Get the user's browser information: timezone, locale, and local time. Runs in the user's browser.",
-                    inputSchema: z.object({}),
-                }),
-
-                setReminder: tool({
-                    description:
-                        "Schedule a reminder for the user at a specified delay. Requires user approval before it is set.",
-                    inputSchema: z.object({
-                        message: z
-                            .string()
-                            .describe("The reminder message to show the user"),
-                        delaySeconds: z
-                            .number()
-                            .int()
-                            .positive()
-                            .describe("How many seconds from now to trigger the reminder"),
-                    }),
-                    needsApproval: async () => true,
-                    execute: async ({ message, delaySeconds }) => {
-                        return await this._scheduleReminder(message, delaySeconds);
-                    },
-                }),
+                    } else {
+                        assistantText = result.response ?? "";
+                        const msgId = `msg-${Date.now()}`;
+                        writer.write({
+                            type: "text-start",
+                            id: msgId,
+                        });
+                        writer.write({
+                            type: "text-delta",
+                            delta: assistantText,
+                            id: msgId,
+                        });
+                        writer.write({
+                            type: "text-end",
+                            id: msgId,
+                        });
+                        break;
+                    }
+                }
             },
-            onFinish,
-            stopWhen: stepCountIs(5),
+            onFinish: ({ messages }) => {
+                this.saveMessages(messages);
+            },
         });
 
-        return result.toUIMessageStreamResponse();
+        return createUIMessageStreamResponse({ stream });
     }
 }
 
