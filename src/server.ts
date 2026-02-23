@@ -278,6 +278,8 @@ Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeri
                                 toolResults.push({ toolCallId, toolName, result: JSON.parse(searchResult) });
                             }
                         }
+                        // Continue to next pass (up to 5) so AI can see the tool results
+                        continue;
                     } else {
                         assistantText = result.response ?? "";
                         const msgId = `msg-${Date.now()}`;
