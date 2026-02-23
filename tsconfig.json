@@ -1,0 +1,23 @@
+{
+    "compilerOptions": {
+        "target": "ESNext",
+        "lib": [
+            "ESNext",
+            "DOM"
+        ],
+        "module": "ESNext",
+        "moduleResolution": "Bundler",
+        "jsx": "react-jsx",
+        "strict": true,
+        "skipLibCheck": true,
+        "types": [
+            "@cloudflare/workers-types/2023-07-01"
+        ],
+        "experimentalDecorators": true,
+        "noEmit": true
+    },
+    "include": [
+        "src",
+        "worker-configuration.d.ts"
+    ]
+}
