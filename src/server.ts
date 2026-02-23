@@ -56,7 +56,7 @@ Today's date: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: 
         }
 
         const result = streamText({
-            model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+            model: workersai("@cf/meta/llama-3.1-8b-instruct"),
             system: systemPrompt,
             messages: await convertToModelMessages(this.messages),
             tools: {

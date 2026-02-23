@@ -1,6 +1,5 @@
 /* ============================================================
    Sage — AI Research Assistant
-   Premium dark-mode design with glassmorphism + animations
    ============================================================ */
 
 /* ── Custom Properties ─────────────────────────────────────── */
@@ -12,9 +11,7 @@
   --border-glow: rgba(139, 92, 246, 0.35);
 
   --accent-1: #8b5cf6;
-  /* violet */
   --accent-2: #06b6d4;
-  /* cyan   */
   --accent-grad: linear-gradient(135deg, var(--accent-1), var(--accent-2));
 
   --text-primary: #f1f3f9;

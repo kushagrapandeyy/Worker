@@ -258,7 +258,7 @@ function Chat() {
                 <div className="sidebar-footer">
                     <div className="model-badge">
                         <span className="model-dot" />
-                        Llama 3.3 70B
+                        Llama 3.1 8B
                     </div>
                     <button className="clear-btn" onClick={clearHistory} title="Clear history">
                         <TrashIcon />
@@ -273,7 +273,7 @@ function Chat() {
                         <div className="empty-state">
                             <div className="empty-icon">✦</div>
                             <h2>Hello, I'm Sage</h2>
-                            <p>Your AI research assistant on Cloudflare. Ask me anything — I can search the web, check your timezone, and even set reminders.</p>
+                            <p>Your AI research assistant on Cloudflare. Ask me anything, I can search the web, check your timezone, and even set reminders.</p>
                         </div>
                     ) : (
                         messages.map((msg) => (
