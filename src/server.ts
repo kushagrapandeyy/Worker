@@ -18,6 +18,7 @@ type WorkersAIMessage = {
     content: string;
     tool_call_id?: string;
     name?: string;
+    tool_calls?: WorkersAIToolCall[];
 };
 
 type WorkersAIToolCall = {
@@ -121,13 +122,12 @@ function uiMessagesToWorkersAI(messages: UIMessage[]): WorkersAIMessage[] {
             if (calls.length > 0) {
                 out.push({
                     role: "assistant",
-                    content: JSON.stringify(
-                        calls.map((t) => ({
-                            id: t.toolCallId,
-                            type: "function",
-                            function: { name: t.toolName, arguments: JSON.stringify(t.input ?? {}) },
-                        }))
-                    ),
+                    content: "",
+                    tool_calls: calls.map((t) => ({
+                        id: t.toolCallId,
+                        type: "function",
+                        function: { name: t.toolName || "unknown", arguments: JSON.stringify(t.input ?? {}) },
+                    })),
                 });
             }
         }
@@ -207,6 +207,7 @@ Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeri
                         stepMessages.push({
                             role: "assistant",
                             content: "",
+                            tool_calls: pendingToolCalls,
                         });
 
                         for (const tc of pendingToolCalls) {
