@@ -136,6 +136,9 @@ function uiMessagesToWorkersAI(messages: UIMessage[]): WorkersAIMessage[] {
 }
 
 export class ChatAgent extends AIChatAgent<Env> {
+    private _isGenerating = false;
+    private _lastRequestTime = 0;
+
     private async _scheduleReminder(message: string, delaySeconds: number) {
         await this.schedule(delaySeconds, "onTask", { message });
         return { scheduled: true, message, inSeconds: delaySeconds };
@@ -154,6 +157,23 @@ export class ChatAgent extends AIChatAgent<Env> {
     }
 
     async onChatMessage(onFinish: StreamTextOnFinishCallback<ToolSet>) {
+        const now = Date.now();
+        if (this._isGenerating || now - this._lastRequestTime < 3000) {
+            console.warn("Blocked concurrent or rapid request. Rate limiting to protect APIs.");
+            const stream = createUIMessageStream({
+                execute: async ({ writer }) => {
+                    const msgId = `msg-${Date.now()}`;
+                    writer.write({ type: "text-start", id: msgId });
+                    writer.write({ type: "text-delta", delta: "Rate limit: Please wait a few seconds before sending another message.", id: msgId });
+                    writer.write({ type: "text-end", id: msgId });
+                }
+            });
+            return createUIMessageStreamResponse({ stream });
+        }
+
+        this._isGenerating = true;
+        this._lastRequestTime = now;
+
         const stateObj = (this.state as Record<string, unknown>) ?? {};
         const pendingReminders: string[] = Array.isArray(
             (stateObj as { reminders?: string[] }).reminders
@@ -184,8 +204,9 @@ Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeri
                 let stepMessages = [...allMessages];
                 let assistantText = "";
                 const toolResults: Array<{ toolCallId: string; toolName: string; result: unknown }> = [];
+                const calledToolNames = new Set<string>();
 
-                for (let step = 0; step < 5; step++) {
+                for (let step = 0; step < 2; step++) {
                     const response = await (this.env.AI as unknown as {
                         run: (model: string, options: {
                             messages: WorkersAIMessage[];
@@ -212,6 +233,18 @@ Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeri
 
                         for (const tc of pendingToolCalls) {
                             const toolName = tc.function.name;
+
+                            if (calledToolNames.has(toolName)) {
+                                // Llama 3 amnesia: it's trying to call the same tool again. Force break.
+                                pendingToolCalls = [];
+                                stepMessages.push({
+                                    role: "user",
+                                    content: `System Error: The AI attempted to call the ${toolName} tool repeatedly. Aborting to prevent infinite loop.`
+                                });
+                                break;
+                            }
+                            calledToolNames.add(toolName);
+
                             let inputArgs: Record<string, unknown> = {};
                             try {
                                 inputArgs = JSON.parse(tc.function.arguments || "{}");
@@ -279,7 +312,13 @@ Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeri
                                 toolResults.push({ toolCallId, toolName, result: JSON.parse(searchResult) });
                             }
                         }
-                        // Continue to next pass (up to 5) so AI can see the tool results
+
+                        if (pendingToolCalls.length === 0) {
+                            // We forcefully broke out of the tool loop due to amnesia
+                            continue;
+                        }
+
+                        // Continue to next pass (up to 2) so AI can see the tool results
                         continue;
                     } else {
                         assistantText = result.response ?? "";
@@ -300,10 +339,18 @@ Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeri
                         break;
                     }
                 }
+
+                this._isGenerating = false;
             },
             onFinish: ({ messages }) => {
+                this._isGenerating = false;
                 this.saveMessages(messages);
             },
+            onError: (error) => {
+                this._isGenerating = false;
+                console.error("Stream error in ChatAgent:", error);
+                return "An error occurred during AI generation.";
+            }
         });
 
         return createUIMessageStreamResponse({ stream });
