@@ -271,16 +271,14 @@ Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeri
                             });
 
                             if (toolName === "getUserInfo") {
-                                // Instead of returning and killing the stream, we just notify the client.
-                                // The client hook useAgentChat's onToolCall will handle this.
                                 writer.write({
                                     type: "tool-output-available",
                                     toolCallId,
-                                    output: { pending: "Waiting for browser..." },
+                                    output: { pending: "Gathering browser data..." },
                                 });
-                                // We don't break/return here; we want the AI to potentially acknowledge it
-                                // or wait for the next pass if the loop permits.
-                                continue;
+                                // Browser tools require ending the current stream so the client can respond
+                                // with the actual data in a subsequent request.
+                                return;
                             }
 
                             if (toolName === "setReminder") {
@@ -325,12 +323,19 @@ Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeri
 
                                 if (!shouldSearch && inputArgs.query) {
                                     console.warn("Blocked likely redundant searchWeb call.");
-                                    // Instead of just continuing, let's inform the AI so it doesn't get confused
+                                    const errorResult = { error: "Search blocked: too frequent or redundant. Use existing knowledge if possible." };
+
+                                    writer.write({
+                                        type: "tool-output-available",
+                                        toolCallId,
+                                        output: errorResult,
+                                    });
+
                                     stepMessages.push({
                                         role: "tool",
                                         tool_call_id: toolCallId,
                                         name: toolName,
-                                        content: JSON.stringify({ error: "Search blocked: too frequent or redundant. Use existing knowledge if possible." }),
+                                        content: JSON.stringify(errorResult),
                                     });
                                     continue;
                                 }
