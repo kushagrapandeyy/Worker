@@ -20,8 +20,10 @@
 
   --user-bubble: rgba(139, 92, 246, 0.18);
   --user-border: rgba(139, 92, 246, 0.4);
-  --bot-bubble: rgba(255, 255, 255, 0.045);
-  --bot-border: rgba(255, 255, 255, 0.07);
+  --bot-bubble: rgba(255, 255, 255, 0.05);
+  --bot-border: rgba(255, 255, 255, 0.08);
+
+  --shadow-premium: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
 
   --sidebar-w: 260px;
   --input-h: 68px;
@@ -69,6 +71,7 @@ body {
   border-right: 1px solid var(--border);
   padding: 28px 18px 20px;
   overflow: hidden;
+  box-shadow: 10px 0 30px -15px rgba(0, 0, 0, 0.3);
 }
 
 .sidebar-logo {
@@ -357,6 +360,7 @@ body {
   background: var(--bot-bubble);
   border: 1px solid var(--bot-border);
   border-bottom-left-radius: 4px;
+  box-shadow: var(--shadow-premium);
 }
 
 .bubble-text {

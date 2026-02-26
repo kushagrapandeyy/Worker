@@ -56,12 +56,18 @@ function ToolCard({ part }: { part: ToolPart; onApprove?: () => void; onReject?:
 
     const label = toolLabels[part.toolName] ?? part.toolName;
 
+    const statusMsg: Record<string, string> = {
+        searchWeb: "Querying global intelligence...",
+        getUserInfo: "Synchronizing environment...",
+        setReminder: "Scheduling system event...",
+    };
+
     if (part.state === "pending") {
         return (
             <div className="tool-card tool-pending">
                 <span className="tool-label">{label}</span>
                 <span className="tool-status-dot" />
-                <span className="tool-status-text">Running…</span>
+                <span className="tool-status-text">{statusMsg[part.toolName] ?? "Executing..."}</span>
             </div>
         );
     }
@@ -256,7 +262,7 @@ function Chat() {
                 <div className="sidebar-footer">
                     <div className="model-badge">
                         <span className="model-dot" />
-                        Llama 3.1 8B
+                        Llama 3.1 8B • Production
                     </div>
                     <button className="clear-btn" onClick={clearHistory} title="Clear history">
                         <TrashIcon />

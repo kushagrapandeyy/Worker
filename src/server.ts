@@ -92,49 +92,40 @@ async function executeSearchWeb(query: string): Promise<string> {
 function uiMessagesToWorkersAI(messages: UIMessage[]): WorkersAIMessage[] {
     const out: WorkersAIMessage[] = [];
     for (const msg of messages) {
-        const textParts = msg.parts.filter((p) => p.type === "text");
+        const textParts = msg.parts.filter((p) => p.type === "text").map(p => (p as { text: string }).text).join("\n");
         const toolParts = msg.parts.filter((p) => typeof p.type === "string" && (p.type.startsWith("tool-") || p.type === "dynamic-tool")) as unknown as Array<{
             type: string; toolCallId: string; toolName?: string; state: string;
             input?: unknown; output?: unknown;
         }>;
 
         if (msg.role === "user") {
-            const text = textParts.map((p) => (p as { text: string }).text).join("\n");
-            if (text) out.push({ role: "user", content: text });
-            for (const t of toolParts) {
+            if (textParts) out.push({ role: "user", content: textParts });
+        } else if (msg.role === "assistant") {
+            const assistantMsg: WorkersAIMessage = { role: "assistant", content: textParts || "" };
+
+            const calls = toolParts.filter(t => t.state === "output-available" || t.state === "rejected" || t.state === "approval-required");
+            if (calls.length > 0) {
+                assistantMsg.tool_calls = calls.map(t => ({
+                    id: t.toolCallId,
+                    type: "function",
+                    function: { name: t.toolName || "unknown", arguments: JSON.stringify(t.input ?? {}) }
+                }));
+            }
+            out.push(assistantMsg);
+
+            // Immediately follow with tool results for this assistant message if they exist
+            for (const t of calls) {
                 if (t.state === "output-available" || t.state === "rejected") {
                     out.push({
                         role: "tool",
                         tool_call_id: t.toolCallId,
                         name: t.toolName,
                         content: t.state === "rejected"
-                            ? "Tool execution was rejected by the user."
-                            : JSON.stringify(t.output),
+                            ? "Error: User rejected this action."
+                            : JSON.stringify(t.output ?? {})
                     });
                 }
             }
-        } else if (msg.role === "assistant") {
-            const text = textParts.map((p) => (p as { text: string }).text).join("\n");
-            const calls = toolParts.filter((t) =>
-                t.state === "output-available" || t.state === "approval-required" || t.state === "rejected"
-            );
-
-            const assistantMsg: WorkersAIMessage = {
-                role: "assistant",
-                content: text || "",
-            };
-
-            if (calls.length > 0) {
-                assistantMsg.tool_calls = calls.map((t) => ({
-                    id: t.toolCallId,
-                    type: "function",
-                    function: {
-                        name: t.toolName || "unknown",
-                        arguments: JSON.stringify(t.input ?? {}),
-                    },
-                }));
-            }
-            out.push(assistantMsg);
         }
     }
     return out;
@@ -163,30 +154,24 @@ export class ChatAgent extends AIChatAgent<Env> {
 
     async onChatMessage(onFinish: StreamTextOnFinishCallback<ToolSet>) {
         const now = Date.now();
-        if (this._isGenerating) {
-            console.warn("Generating flag is true, but allowing request to prevent stuck state.");
-            // this._isGenerating = false; // Optional: force reset
+        if (this._isGenerating && (now - this._lastRequestTime < 10000)) {
+            console.warn("Possible concurrent request within 10s. Guarding state.");
         }
 
         this._isGenerating = true;
         this._lastRequestTime = now;
 
         const stateObj = (this.state as Record<string, unknown>) ?? {};
-        const pendingReminders: string[] = Array.isArray(
-            (stateObj as { reminders?: string[] }).reminders
-        )
+        const pendingReminders: string[] = Array.isArray((stateObj as { reminders?: string[] }).reminders)
             ? (stateObj as { reminders: string[] }).reminders
             : [];
 
-        let systemContent = `You are Sage, a premium AI Workspace Assistant designed for professional business environments.
-Your goal is to provide fast, accurate, and highly professional assistance to clients and team members.
-Be proactive, cordial, and precise. Use your tools to enhance your capabilities.
-Use searchWeb when the user requires external real-time data, but prioritize internal context if available.
-Always maintain a helpful and sophisticated tone.
-Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}.`;
+        const systemContent = `You are Sage AI, a high-performance Enterprise Workspace Assistant. 
+Your tone is professional, helpful, and direct. You are running on Cloudflare's edge.
+Current Date: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}.
+${pendingReminders.length > 0 ? `\n\nREMINDERS FOR USER:\n${pendingReminders.join("\n")}` : ""}`;
 
         if (pendingReminders.length > 0) {
-            systemContent += `\n\nACTIVE REMINDERS:\n${pendingReminders.join("\n")}\nPlease inform the user about these reminders in a professional manner.`;
             this.setState({ ...stateObj, reminders: [] });
         }
 
@@ -198,205 +183,87 @@ Today: ${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeri
 
         const stream = createUIMessageStream({
             execute: async ({ writer }) => {
-                let pendingToolCalls: WorkersAIToolCall[] = [];
-                let stepMessages = [...allMessages];
-                let assistantText = "";
-                const toolResults: Array<{ toolCallId: string; toolName: string; result: unknown }> = [];
-                const calledToolNames = new Set<string>();
+                try {
+                    let stepMessages = [...allMessages];
+                    const calledTools = new Set<string>();
 
-                for (let step = 0; step < 2; step++) {
-                    console.log(`AI pass ${step} started. messages count: ${stepMessages.length}`);
-                    const response = await (this.env.AI as unknown as {
-                        run: (model: string, options: {
-                            messages: WorkersAIMessage[];
-                            tools: typeof TOOLS_SCHEMA;
-                            stream: boolean;
-                            max_tokens: number;
-                        }) => Promise<ReadableStream | { response?: string; tool_calls?: WorkersAIToolCall[] }>;
-                    }).run("@cf/meta/llama-3.1-8b-instruct", {
-                        messages: stepMessages,
-                        tools: TOOLS_SCHEMA,
-                        stream: false,
-                        max_tokens: 512,
-                    }).catch(err => {
-                        console.error("AI.run failed:", err);
-                        throw err;
-                    });
+                    for (let pass = 0; pass < 3; pass++) {
+                        console.log(`[Sage] AI Pass ${pass}, History: ${stepMessages.length} msgs`);
 
-                    const result = response as { response?: string; tool_calls?: WorkersAIToolCall[] };
-                    pendingToolCalls = result.tool_calls ?? [];
-
-                    if (pendingToolCalls.length > 0) {
-                        stepMessages.push({
-                            role: "assistant",
-                            content: "",
-                            tool_calls: pendingToolCalls,
+                        const aiResponse = await (this.env.AI as unknown as {
+                            run: (model: string, options: {
+                                messages: WorkersAIMessage[];
+                                tools: typeof TOOLS_SCHEMA;
+                                stream: boolean;
+                                max_tokens: number;
+                            }) => Promise<{ response?: string; tool_calls?: WorkersAIToolCall[] }>;
+                        }).run("@cf/meta/llama-3.1-8b-instruct", {
+                            messages: stepMessages,
+                            tools: TOOLS_SCHEMA,
+                            stream: false,
+                            max_tokens: 1024,
+                        }).catch(e => {
+                            console.error("[Sage] Model Execution Error:", e);
+                            throw new Error("Model failed to respond.");
                         });
 
-                        for (const tc of pendingToolCalls) {
-                            const toolName = tc.function.name;
+                        const { response, tool_calls } = aiResponse;
 
-                            if (calledToolNames.size >= 1) {
-                                pendingToolCalls = [];
-                                break;
-                            }
+                        if (tool_calls && tool_calls.length > 0) {
+                            // Professional Tool Execution
+                            const filteredCalls = tool_calls.filter(tc => !calledTools.has(tc.function.name));
+                            if (filteredCalls.length === 0) break; // Avoid infinite recursion
 
-                            if (calledToolNames.has(toolName)) {
-                                // Llama 3 amnesia: it's trying to call the same tool again. Force break.
-                                pendingToolCalls = [];
-                                stepMessages.push({
-                                    role: "user",
-                                    content: `System Error: The AI attempted to call the ${toolName} tool repeatedly. Aborting to prevent infinite loop.`
-                                });
-                                break;
-                            }
-                            calledToolNames.add(toolName);
+                            const assistantEntry: WorkersAIMessage = { role: "assistant", content: response || "", tool_calls: filteredCalls };
+                            stepMessages.push(assistantEntry);
 
-                            let inputArgs: Record<string, unknown> = {};
-                            try {
-                                inputArgs = JSON.parse(tc.function.arguments || "{}");
-                            } catch { /* ignore parse error */ }
+                            for (const tc of filteredCalls) {
+                                calledTools.add(tc.function.name);
+                                const toolName = tc.function.name;
+                                let args: Record<string, any> = {};
+                                try { args = JSON.parse(tc.function.arguments || "{}"); } catch { }
 
-                            const toolCallId = tc.id || `call_${Math.random().toString(36).slice(2, 9)}`;
+                                writer.write({ type: "tool-input-available", toolCallId: tc.id, toolName, input: args });
 
-                            writer.write({
-                                type: "tool-input-available",
-                                toolCallId,
-                                toolName,
-                                input: inputArgs,
-                            });
-
-                            if (toolName === "getUserInfo") {
-                                writer.write({
-                                    type: "tool-output-available",
-                                    toolCallId,
-                                    output: { pending: "Gathering browser data..." },
-                                });
-                                // Browser tools require ending the current stream so the client can respond
-                                // with the actual data in a subsequent request.
-                                return;
-                            }
-
-                            if (toolName === "setReminder") {
-                                const schema = z.object({
-                                    message: z.string(),
-                                    delaySeconds: z.number(),
-                                });
-                                const parsed = schema.safeParse(inputArgs);
-                                if (parsed.success) {
-                                    const result = await this._scheduleReminder(
-                                        parsed.data.message,
-                                        parsed.data.delaySeconds
-                                    );
-                                    writer.write({
-                                        type: "tool-output-available",
-                                        toolCallId,
-                                        output: result,
-                                    });
-                                    stepMessages.push({
-                                        role: "tool",
-                                        tool_call_id: toolCallId,
-                                        name: toolName,
-                                        content: JSON.stringify(result),
-                                    });
-                                    toolResults.push({ toolCallId, toolName, result });
-                                }
-                                continue;
-                            }
-
-                            if (toolName === "searchWeb") {
-
-                                // 🔒 GUARD: Only allow search if user explicitly requests live/current info
-                                const lastUserMessage = historyMessages
-                                    .filter(m => m.role === "user")
-                                    .slice(-1)[0]?.content?.toLowerCase() ?? "";
-
-                                const triggerWords = ["search", "latest", "current", "today", "news", "real-time"];
-
-                                const shouldSearch = triggerWords.some(word =>
-                                    lastUserMessage.includes(word)
-                                );
-
-                                if (!shouldSearch && inputArgs.query) {
-                                    console.warn("Blocked likely redundant searchWeb call.");
-                                    const errorResult = { error: "Search blocked: too frequent or redundant. Use existing knowledge if possible." };
-
-                                    writer.write({
-                                        type: "tool-output-available",
-                                        toolCallId,
-                                        output: errorResult,
-                                    });
-
-                                    stepMessages.push({
-                                        role: "tool",
-                                        tool_call_id: toolCallId,
-                                        name: toolName,
-                                        content: JSON.stringify(errorResult),
-                                    });
-                                    continue;
+                                if (toolName === "getUserInfo") {
+                                    writer.write({ type: "tool-output-available", toolCallId: tc.id, output: { status: "fetching" } });
+                                    return; // Handled by client
                                 }
 
-                                const query = (inputArgs.query as string) ?? "";
-                                const searchResult = await executeSearchWeb(query);
+                                let output: any = { error: "Unknown tool" };
+                                if (toolName === "searchWeb") {
+                                    output = JSON.parse(await executeSearchWeb(args.query || ""));
+                                } else if (toolName === "setReminder") {
+                                    output = await this._scheduleReminder(args.message, args.delaySeconds || 60);
+                                }
 
-                                writer.write({
-                                    type: "tool-output-available",
-                                    toolCallId,
-                                    output: JSON.parse(searchResult),
-                                });
-
-                                stepMessages.push({
-                                    role: "tool",
-                                    tool_call_id: toolCallId,
-                                    name: toolName,
-                                    content: searchResult,
-                                });
-
-                                toolResults.push({
-                                    toolCallId,
-                                    toolName,
-                                    result: JSON.parse(searchResult),
-                                });
+                                writer.write({ type: "tool-output-available", toolCallId: tc.id, output });
+                                stepMessages.push({ role: "tool", tool_call_id: tc.id, name: toolName, content: JSON.stringify(output) });
                             }
+                            continue; // Next pass to see results
                         }
 
-                        if (pendingToolCalls.length > 1) {
-                            // We forcefully broke out of the tool loop due to amnesia
-                            pendingToolCalls = [pendingToolCalls[0]];
+                        if (response) {
+                            const msgId = `msg-${Date.now()}`;
+                            writer.write({ type: "text-start", id: msgId });
+                            writer.write({ type: "text-delta", delta: response, id: msgId });
+                            writer.write({ type: "text-end", id: msgId });
+                            break;
                         }
-
-                        // Continue to next pass (up to 2) so AI can see the tool results
-                        continue;
-                    } else {
-                        assistantText = result.response ?? "";
-                        const msgId = `msg-${Date.now()}`;
-                        writer.write({
-                            type: "text-start",
-                            id: msgId,
-                        });
-                        writer.write({
-                            type: "text-delta",
-                            delta: assistantText,
-                            id: msgId,
-                        });
-                        writer.write({
-                            type: "text-end",
-                            id: msgId,
-                        });
                         break;
                     }
+                } catch (err) {
+                    const msgId = `error-${Date.now()}`;
+                    writer.write({ type: "text-start", id: msgId });
+                    writer.write({ type: "text-delta", delta: "I encountered a technical glitch while processing that. Please try again in a moment.", id: msgId });
+                    writer.write({ type: "text-end", id: msgId });
+                } finally {
+                    this._isGenerating = false;
                 }
-
-                this._isGenerating = false;
             },
             onFinish: ({ messages }) => {
                 this._isGenerating = false;
                 this.saveMessages(messages);
-            },
-            onError: (error) => {
-                this._isGenerating = false;
-                console.error("Stream error in ChatAgent:", error);
-                return "An error occurred during AI generation.";
             }
         });
 
